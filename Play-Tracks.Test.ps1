@@ -16,6 +16,15 @@ if ($parseErrors.Count -gt 0) {
 
 $functionsUnderTest = @(
     'Stop-TrackPlayback',
+    'Reset-TrackPlaybackProgress',
+    'Set-TrackPlaybackButtonState',
+    'Set-TrackOffsetNowLinksState',
+    'Set-TrackOffsetToNow',
+    'Pause-TrackPlayback',
+    'Resume-TrackPlayback',
+    'Format-TrackTime',
+    'Update-TrackPlaybackProgress',
+    'Seek-TrackPlayback',
     'Update-TrackPlaybackVolume',
     'Get-TrackFiles',
     'Get-TrackSettingsSnapshot',
@@ -48,11 +57,17 @@ Describe 'Play-Tracks regression tests' {
         $script:defaultDeviceRadios = @()
         $script:defaultDeviceIndex = -1
         $script:playbacks = @{}
+        $script:trackPlayButtons = @{}
+        $script:trackOffsetNowLinks = @{}
         $script:trackVolumes = @{}
         $script:trackFades = @{}
+        $script:trackOffsets = @{}
         $script:trackDeviceSelections = @{}
         $script:initialDeviceVolumes = @()
-        $script:trackStatusLabels = @{}
+        $script:trackProgressSliders = @{}
+        $script:trackProgressMarkerPanels = @{}
+        $script:trackTimeLabels = @{}
+        $script:trackDurations = @{}
         $script:lastTrackPaths = @()
     }
 
@@ -77,7 +92,9 @@ Describe 'Play-Tracks regression tests' {
     It 'applies the requested track volume multiplied by the fade-in envelope' {
         $script:trackVolumes['track.mp3'] = 80
         $playback = @{
-            StartedAt = [DateTime]::UtcNow.AddMilliseconds(-250)
+            Reader = [pscustomobject]@{ CurrentTime = [TimeSpan]::FromMilliseconds(250) }
+            StartOffset = [TimeSpan]::Zero
+            EndTime = [TimeSpan]::FromSeconds(10)
             Duration = [TimeSpan]::FromSeconds(10)
             FadeInMs = 1000
             FadeOutMs = 0
@@ -92,7 +109,9 @@ Describe 'Play-Tracks regression tests' {
     It 'applies the fade-out envelope and returns to the requested volume when fades are disabled' {
         $script:trackVolumes['track.mp3'] = 60
         $playback = @{
-            StartedAt = [DateTime]::UtcNow.AddMilliseconds(-9500)
+            Reader = [pscustomobject]@{ CurrentTime = [TimeSpan]::FromMilliseconds(9500) }
+            StartOffset = [TimeSpan]::Zero
+            EndTime = [TimeSpan]::FromSeconds(10)
             Duration = [TimeSpan]::FromSeconds(10)
             FadeInMs = 0
             FadeOutMs = 2000
@@ -107,7 +126,24 @@ Describe 'Play-Tracks regression tests' {
         [Math]::Abs($playback.VolumeProvider.Volume - 0.6) | Should BeLessThan 0.001
     }
 
-    It 'stops and disposes only the requested track playback and clears its status' {
+    It 'calculates fade envelopes relative to the configured playback offsets' {
+        $script:trackVolumes['track.mp3'] = 80
+        $playback = @{
+            Reader = [pscustomobject]@{ CurrentTime = [TimeSpan]::FromMilliseconds(65500) }
+            StartOffset = [TimeSpan]::FromMilliseconds(65000)
+            EndTime = [TimeSpan]::FromMilliseconds(70000)
+            Duration = [TimeSpan]::FromSeconds(90)
+            FadeInMs = 1000
+            FadeOutMs = 1000
+            VolumeProvider = [pscustomobject]@{ Volume = 0.0 }
+        }
+
+        Update-TrackPlaybackVolume -Path 'track.mp3' -Playback $playback
+
+        [Math]::Abs($playback.VolumeProvider.Volume - 0.4) | Should BeLessThan 0.02
+    }
+
+    It 'stops and disposes only the requested track playback and disables its progress slider' {
         $output = [pscustomobject]@{ StopCount = 0; DisposeCount = 0 }
         $output | Add-Member ScriptMethod Stop { $this.StopCount++ }
         $output | Add-Member ScriptMethod Dispose { $this.DisposeCount++ }
@@ -119,7 +155,13 @@ Describe 'Play-Tracks regression tests' {
             VolumeProvider = $provider
         }
         $script:playbacks['second.mp3'] = $otherPlayback
-        $script:trackStatusLabels['first.mp3'] = [pscustomobject]@{ Text = 'Playing...' }
+        $script:trackProgressSliders['first.mp3'] = [pscustomobject]@{
+            IsDisposed = $false
+            Enabled = $true
+            Minimum = 0
+            Maximum = 10000
+            Value = 5000
+        }
 
         Stop-TrackPlayback -Path 'first.mp3'
 
@@ -128,7 +170,133 @@ Describe 'Play-Tracks regression tests' {
         $output.StopCount | Should Be 1
         $output.DisposeCount | Should Be 1
         $provider.DisposeCount | Should Be 1
-        $script:trackStatusLabels['first.mp3'].Text | Should Be ''
+        $script:trackProgressSliders['first.mp3'].Enabled | Should Be $false
+        $script:trackProgressSliders['first.mp3'].Value | Should Be 0
+    }
+
+    It 'pauses and resumes playback without changing the current position' {
+        $output = [pscustomobject]@{ PauseCount = 0; PlayCount = 0 }
+        $output | Add-Member ScriptMethod Pause { $this.PauseCount++ }
+        $output | Add-Member ScriptMethod Play { $this.PlayCount++ }
+        $button = [pscustomobject]@{ IsDisposed = $false; Checked = $true; Text = 'Pause' }
+        $script:trackPlayButtons['track.mp3'] = $button
+        $script:playbacks['track.mp3'] = @{
+            Output = $output
+            IsPaused = $false
+            Reader = [pscustomobject]@{ CurrentTime = [TimeSpan]::FromSeconds(42) }
+        }
+
+        Pause-TrackPlayback -Path 'track.mp3'
+
+        $script:playbacks['track.mp3'].IsPaused | Should Be $true
+        $button.Checked | Should Be $false
+        $button.Text | Should Be 'Play'
+        $script:playbacks['track.mp3'].Reader.CurrentTime.TotalSeconds | Should Be 42
+
+        Resume-TrackPlayback -Path 'track.mp3'
+
+        $script:playbacks['track.mp3'].IsPaused | Should Be $false
+        $button.Checked | Should Be $true
+        $button.Text | Should Be 'Pause'
+        $script:playbacks['track.mp3'].Reader.CurrentTime.TotalSeconds | Should Be 42
+        $output.PauseCount | Should Be 1
+        $output.PlayCount | Should Be 1
+    }
+
+    It 'sets the start offset to the current track position' {
+        $script:playbacks['track.mp3'] = @{
+            Reader = [pscustomobject]@{ CurrentTime = [TimeSpan]::FromMilliseconds(65042) }
+            Duration = [TimeSpan]::FromSeconds(180)
+        }
+        $offset = [pscustomobject]@{ Minimum = 0; Maximum = 3600000; Value = 0 }
+
+        Set-TrackOffsetToNow -Path 'track.mp3' -OffsetType Start -OffsetControl $offset
+
+        $offset.Value | Should Be 65042
+    }
+
+    It 'sets the end offset to the remaining time from the current track position' {
+        $script:playbacks['track.mp3'] = @{
+            Reader = [pscustomobject]@{ CurrentTime = [TimeSpan]::FromSeconds(65) }
+            Duration = [TimeSpan]::FromSeconds(180)
+        }
+        $offset = [pscustomobject]@{ Minimum = 0; Maximum = 3600000; Value = 0 }
+
+        Set-TrackOffsetToNow -Path 'track.mp3' -OffsetType End -OffsetControl $offset
+
+        $offset.Value | Should Be 115000
+    }
+
+    It 'updates the seek range and current-versus-total time display' {
+        $slider = [pscustomobject]@{
+            IsDisposed = $false
+            Minimum = 0
+            Maximum = 1
+            Value = 0
+            Enabled = $false
+        }
+        $label = [pscustomobject]@{ IsDisposed = $false; Text = '' }
+        $script:trackProgressSliders['track.mp3'] = $slider
+        $script:trackTimeLabels['track.mp3'] = $label
+        $playback = @{
+            Reader = [pscustomobject]@{ CurrentTime = [TimeSpan]::FromSeconds(90) }
+            StartOffset = [TimeSpan]::FromSeconds(65)
+            EndTime = [TimeSpan]::FromSeconds(150)
+            Duration = [TimeSpan]::FromSeconds(180)
+            UpdatingProgress = $false
+        }
+
+        Update-TrackPlaybackProgress -Path 'track.mp3' -Playback $playback
+
+        $slider.Minimum | Should Be 0
+        $slider.Maximum | Should Be 180000
+        $slider.Value | Should Be 90000
+        $slider.Enabled | Should Be $true
+        $label.Text | Should Be '1:30 / 3:00'
+    }
+
+    It 'allows seeking outside configured offsets while retaining the full-track progress range' {
+        $script:trackVolumes['track.mp3'] = 100
+        $slider = [pscustomobject]@{
+            IsDisposed = $false
+            Minimum = 0
+            Maximum = 180000
+            Value = 65000
+            Enabled = $true
+        }
+        $label = [pscustomobject]@{ IsDisposed = $false; Text = '' }
+        $script:trackProgressSliders['track.mp3'] = $slider
+        $script:trackTimeLabels['track.mp3'] = $label
+        $playback = @{
+            Reader = [pscustomobject]@{ CurrentTime = [TimeSpan]::FromSeconds(65) }
+            StartOffset = [TimeSpan]::FromSeconds(65)
+            ConfiguredEndTime = [TimeSpan]::FromSeconds(150)
+            EndTime = [TimeSpan]::FromSeconds(150)
+            Duration = [TimeSpan]::FromSeconds(180)
+            FadeInMs = 0
+            FadeOutMs = 0
+            UpdatingProgress = $false
+            VolumeProvider = [pscustomobject]@{ Volume = 0.0 }
+        }
+        $script:playbacks['track.mp3'] = $playback
+
+        Seek-TrackPlayback -Path 'track.mp3' -PositionMs 165000
+
+        $playback.Reader.CurrentTime.TotalMilliseconds | Should Be 165000
+        $playback.EndTime | Should Be ([TimeSpan]::FromSeconds(180))
+        $slider.Minimum | Should Be 0
+        $slider.Maximum | Should Be 180000
+        $slider.Value | Should Be 165000
+
+        Seek-TrackPlayback -Path 'track.mp3' -PositionMs 120000
+
+        $playback.Reader.CurrentTime.TotalMilliseconds | Should Be 120000
+        $playback.EndTime | Should Be ([TimeSpan]::FromSeconds(150))
+
+        Seek-TrackPlayback -Path 'track.mp3' -PositionMs 30000
+
+        $playback.Reader.CurrentTime.TotalMilliseconds | Should Be 30000
+        $playback.EndTime | Should Be ([TimeSpan]::FromSeconds(180))
     }
 
     It 'saves per-track settings with a SHA-256 hash and device IDs' {
@@ -149,6 +317,8 @@ Describe 'Play-Tracks regression tests' {
             VolumeSlider = [pscustomobject]@{ Value = 35 }
             FadeInInput = [pscustomobject]@{ Value = 500 }
             FadeOutInput = [pscustomobject]@{ Value = 1200 }
+            StartOffsetInput = [pscustomobject]@{ Value = 65000 }
+            EndOffsetInput = [pscustomobject]@{ Value = 3000 }
         }
         $script:trackPanel.Controls = @([pscustomobject]@{ Tag = $track })
 
@@ -165,6 +335,8 @@ Describe 'Play-Tracks regression tests' {
         $savedTrack.Volume | Should Be 35
         $savedTrack.FadeInMs | Should Be 500
         $savedTrack.FadeOutMs | Should Be 1200
+        $savedTrack.StartOffsetMs | Should Be 65000
+        $savedTrack.EndOffsetMs | Should Be 3000
     }
 
     It 'restores settings to a renamed track by matching its hash' {
@@ -181,6 +353,8 @@ Describe 'Play-Tracks regression tests' {
             VolumeSlider = [pscustomobject]@{ Value = 50 }
             FadeInInput = [pscustomobject]@{ Value = 0 }
             FadeOutInput = [pscustomobject]@{ Value = 0 }
+            StartOffsetInput = [pscustomobject]@{ Value = 0 }
+            EndOffsetInput = [pscustomobject]@{ Value = 0 }
         }
         $script:trackPanel.Controls = @([pscustomobject]@{ Tag = $track })
         $settings = [pscustomobject]@{
@@ -194,6 +368,8 @@ Describe 'Play-Tracks regression tests' {
                 Volume = 33
                 FadeInMs = 800
                 FadeOutMs = 900
+                StartOffsetMs = 65000
+                EndOffsetMs = 3000
             })
         }
 
@@ -202,10 +378,43 @@ Describe 'Play-Tracks regression tests' {
         $track.VolumeSlider.Value | Should Be 33
         $track.FadeInInput.Value | Should Be 800
         $track.FadeOutInput.Value | Should Be 900
+        $track.StartOffsetInput.Value | Should Be 65000
+        $track.EndOffsetInput.Value | Should Be 3000
         $track.DevicePicker.SelectedIndex | Should Be 1
         $script:trackDeviceSelections[$trackPath] | Should Be 1
         $script:deviceMasterSliders[0].Value | Should Be 42
         $script:defaultDeviceRadios[0].Checked | Should Be $true
+    }
+
+    It 'loads older track settings without offset fields as zero offsets' {
+        $trackPath = Join-Path $script:tracksPath 'legacy.mp3'
+        Set-Content -LiteralPath $trackPath -Value 'legacy audio content'
+        $hash = (Get-FileHash -LiteralPath $trackPath -Algorithm SHA256).Hash
+        $track = [pscustomobject]@{
+            Path = $trackPath
+            DevicePicker = [pscustomobject]@{ SelectedIndex = 0 }
+            VolumeSlider = [pscustomobject]@{ Value = 50 }
+            FadeInInput = [pscustomobject]@{ Value = 0 }
+            FadeOutInput = [pscustomobject]@{ Value = 0 }
+            StartOffsetInput = [pscustomobject]@{ Value = 300 }
+            EndOffsetInput = [pscustomobject]@{ Value = 400 }
+        }
+        $script:trackPanel.Controls = @([pscustomobject]@{ Tag = $track })
+        $settings = [pscustomobject]@{
+            Version = 1
+            Tracks = @([pscustomobject]@{
+                FileName = 'legacy.mp3'
+                Sha256 = $hash
+                Volume = 50
+                FadeInMs = 0
+                FadeOutMs = 0
+            })
+        }
+
+        Apply-TrackSettings -Settings $settings
+
+        $track.StartOffsetInput.Value | Should Be 0
+        $track.EndOffsetInput.Value | Should Be 0
     }
 
     It 'ignores saved tracks that are not present' {
@@ -232,6 +441,8 @@ Describe 'Play-Tracks regression tests' {
             VolumeSlider = [pscustomobject]@{ Value = 8 }
             FadeInInput = [pscustomobject]@{ Value = 100 }
             FadeOutInput = [pscustomobject]@{ Value = 200 }
+            StartOffsetInput = [pscustomobject]@{ Value = 300 }
+            EndOffsetInput = [pscustomobject]@{ Value = 400 }
             DevicePicker = [pscustomobject]@{ SelectedIndex = 2 }
         }
         $script:trackPanel.Controls = @([pscustomobject]@{ Tag = $track })
@@ -247,6 +458,8 @@ Describe 'Play-Tracks regression tests' {
         $track.VolumeSlider.Value | Should Be 50
         $track.FadeInInput.Value | Should Be 0
         $track.FadeOutInput.Value | Should Be 0
+        $track.StartOffsetInput.Value | Should Be 0
+        $track.EndOffsetInput.Value | Should Be 0
         $track.DevicePicker.SelectedIndex | Should Be 0
         $script:deviceMasterSliders[0].Value | Should Be 64
         $script:defaultDeviceRadios[0].Checked | Should Be $true
