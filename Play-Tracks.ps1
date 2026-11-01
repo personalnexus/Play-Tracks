@@ -88,11 +88,8 @@ function Stop-TrackPlayback {
     } else {
         Set-TrackPlaybackButtonState -Path $Path -IsPlaying $false
         Set-TrackOffsetNowLinksState -Path $Path -Enabled $false
-        if ($script:trackProgressSliders.ContainsKey($Path)) {
-            $slider = $script:trackProgressSliders[$Path]
-            if (-not $slider.IsDisposed) {
-                $duration = [TimeSpan]::FromMilliseconds($slider.Maximum)
-            }
+        if ($script:trackDurations.ContainsKey($Path)) {
+            $duration = $script:trackDurations[$Path]
         }
         Reset-TrackPlaybackProgress -Path $Path -Duration $duration
     }
@@ -107,15 +104,26 @@ function Reset-TrackPlaybackProgress {
     if ($script:trackProgressSliders.ContainsKey($Path)) {
         $slider = $script:trackProgressSliders[$Path]
         if (-not $slider.IsDisposed) {
-            $slider.Enabled = $false
-            $slider.Minimum = 0
+            $durationIsKnown = $false
             if ($null -ne $Duration -and ([TimeSpan]$Duration).TotalMilliseconds -le [int]::MaxValue) {
+                $durationIsKnown = $true
+            } elseif (
+                $script:trackDurations.ContainsKey($Path) -and
+                $script:trackDurations[$Path].TotalMilliseconds -le [int]::MaxValue
+            ) {
+                $Duration = $script:trackDurations[$Path]
+                $durationIsKnown = $true
+            }
+
+            $slider.Minimum = 0
+            if ($durationIsKnown) {
                 $durationMs = [int]([TimeSpan]$Duration).TotalMilliseconds
             } else {
                 $durationMs = [Math]::Max(1, $slider.Maximum)
             }
             $slider.Maximum = [Math]::Max(1, $durationMs)
             $slider.Value = 0
+            $slider.Enabled = $durationIsKnown
         }
     }
     if ($script:trackTimeLabels.ContainsKey($Path)) {
@@ -128,7 +136,7 @@ function Reset-TrackPlaybackProgress {
                     $Duration = [TimeSpan]::Zero
                 }
             }
-            $label.Text = '0:00 / {0}' -f (Format-TrackTime -Time ([TimeSpan]$Duration))
+            $label.Text = '00:00 / {0}' -f (Format-TrackTimestamp -Time ([TimeSpan]$Duration))
         }
     }
 }
@@ -289,6 +297,16 @@ function Set-TrackTimestampControl {
     $propertyName = '{0}TimeMs' -f $TimestampType
     $script:trackOffsets[$Path][$propertyName] = $TimestampMs
     $TimestampControl.Text = Format-TrackTimestamp -Time ([TimeSpan]::FromMilliseconds($TimestampMs))
+    if (
+        $TimestampType -eq 'Start' -and
+        -not $script:playbacks.ContainsKey($Path) -and
+        $script:trackProgressSliders.ContainsKey($Path)
+    ) {
+        $slider = $script:trackProgressSliders[$Path]
+        if (-not $slider.IsDisposed -and $slider.Enabled) {
+            $slider.Value = [int][Math]::Min($slider.Maximum, $TimestampMs)
+        }
+    }
     if ($script:trackProgressMarkerPanels.ContainsKey($Path)) {
         $script:trackProgressMarkerPanels[$Path].Invalidate()
     }
@@ -320,15 +338,22 @@ function Set-TrackDurationControls {
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][TimeSpan]$Duration,
         [Parameter(Mandatory = $true)][object]$TimeLabel,
-        [Parameter(Mandatory = $true)][object]$ProgressSlider
+        [Parameter(Mandatory = $true)][object]$ProgressSlider,
+        [long]$InitialPositionMs = 0
     )
 
     $script:trackDurations[$Path] = $Duration
-    $TimeLabel.Text = '0:00 / {0}' -f (Format-TrackTime -Time $Duration)
+    $TimeLabel.Text = '00:00 / {0}' -f (Format-TrackTimestamp -Time $Duration)
     if ($Duration.TotalMilliseconds -le [int]::MaxValue) {
         $ProgressSlider.Minimum = 0
         $ProgressSlider.Maximum = [Math]::Max(1, [int][Math]::Floor($Duration.TotalMilliseconds))
-        $ProgressSlider.Value = 0
+        $ProgressSlider.Value = [int][Math]::Min(
+            $ProgressSlider.Maximum,
+            [Math]::Max(0, $InitialPositionMs)
+        )
+        $ProgressSlider.Enabled = $true
+    } else {
+        $ProgressSlider.Enabled = $false
     }
 }
 
@@ -373,8 +398,8 @@ function Update-TrackPlaybackProgress {
     if ($script:trackTimeLabels.ContainsKey($Path)) {
         $label = $script:trackTimeLabels[$Path]
         if (-not $label.IsDisposed) {
-            $label.Text = '{0} / {1}' -f (Format-TrackTime -Time $currentTime), (
-                Format-TrackTime -Time $Playback.Duration
+            $label.Text = '{0} / {1}' -f (Format-TrackTimestamp -Time $currentTime), (
+                Format-TrackTimestamp -Time $Playback.Duration
             )
         }
     }
@@ -424,6 +449,62 @@ function Update-TrackPlaybackVolume {
     $Playback.VolumeProvider.Volume = [single]($trackVolume * $fadeFactor)
 }
 
+function Resolve-TrackEndTime {
+    param(
+        [Parameter(Mandatory = $true)][TimeSpan]$Duration,
+        [Parameter(Mandatory = $true)][long]$EndTimeMs
+    )
+
+    $displayedDurationMs = [long][Math]::Floor($Duration.TotalMilliseconds)
+    if ($EndTimeMs -eq $displayedDurationMs) {
+        return $Duration
+    }
+
+    [TimeSpan]::FromMilliseconds($EndTimeMs)
+}
+
+function Test-TrackPlaybackComplete {
+    param([Parameter(Mandatory = $true)][hashtable]$Playback)
+
+    if ($Playback.Output -and $Playback.Output.PlaybackState.ToString() -eq 'Stopped') {
+        return $true
+    }
+
+    $currentTime = $Playback.Reader.CurrentTime
+    if ($currentTime -ge $Playback.EndTime) {
+        return $true
+    }
+
+    if (
+        -not $Playback.IsPaused -and
+        $Playback.EndTime -eq $Playback.Duration -and
+        ($Playback.Duration - $currentTime) -le [TimeSpan]::FromMilliseconds(50)
+    ) {
+        return $true
+    }
+
+    return $false
+}
+
+function Resolve-TrackPlaybackRange {
+    param(
+        [Parameter(Mandatory = $true)][long]$SelectedTimeMs,
+        [Parameter(Mandatory = $true)][long]$ConfiguredStartTimeMs,
+        [Parameter(Mandatory = $true)][long]$ConfiguredEndTimeMs,
+        [Parameter(Mandatory = $true)][long]$DurationMs
+    )
+
+    $endTimeMs = $ConfiguredEndTimeMs
+    if ($SelectedTimeMs -lt $ConfiguredStartTimeMs -or $SelectedTimeMs -gt $ConfiguredEndTimeMs) {
+        $endTimeMs = $DurationMs
+    }
+
+    [pscustomobject]@{
+        StartTimeMs = $SelectedTimeMs
+        EndTimeMs = $endTimeMs
+    }
+}
+
 function Start-TrackPlayback {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -462,7 +543,7 @@ function Start-TrackPlayback {
             throw 'The start timestamp must be before the end timestamp, and both must be within the track.'
         }
         $startTime = [TimeSpan]::FromMilliseconds($StartTimeMs)
-        $endTime = [TimeSpan]::FromMilliseconds($EndTimeMs)
+        $endTime = Resolve-TrackEndTime -Duration $duration -EndTimeMs $EndTimeMs
         $reader.CurrentTime = $startTime
         $volumeProvider = New-Object NAudio.Wave.WaveChannel32 -ArgumentList $reader
         $volumeProvider.Volume = [single]($Volume / 100.0)
@@ -693,18 +774,19 @@ function Refresh-AudioDevices {
         $deviceRow.RowCount = 1
         $deviceRow.Margin = New-Object System.Windows.Forms.Padding(2)
         $deviceRow.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle(
-            [System.Windows.Forms.SizeType]::Percent,
-            100
-        )))
-        $deviceRow.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle(
             [System.Windows.Forms.SizeType]::Absolute,
             220
+        )))
+        $deviceRow.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle(
+            [System.Windows.Forms.SizeType]::Percent,
+            100
         )))
 
         $radio = New-Object System.Windows.Forms.RadioButton
         $radio.Text = $device.FriendlyName
         $radio.Tag = $index
         $radio.Dock = [System.Windows.Forms.DockStyle]::Fill
+        $radio.AutoEllipsis = $true
         $radio.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
         $radio.Margin = New-Object System.Windows.Forms.Padding(4)
         $radio.Add_CheckedChanged({
@@ -754,8 +836,8 @@ function Refresh-AudioDevices {
             $script:initialDeviceVolumes += $currentVolume
         }
         $script:deviceMasterSliders += $masterSlider
-        $deviceRow.Controls.Add($radio, 0, 0)
-        $deviceRow.Controls.Add($masterSlider, 1, 0)
+        $deviceRow.Controls.Add($masterSlider, 0, 0)
+        $deviceRow.Controls.Add($radio, 1, 0)
         $script:devicePanel.Controls.Add($deviceRow)
     }
 
@@ -1254,7 +1336,7 @@ function Update-TrackButtons {
             )))
             $progressPanel.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle(
                 [System.Windows.Forms.SizeType]::Absolute,
-                120
+                220
             )))
             $progressPanel.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle(
                 [System.Windows.Forms.SizeType]::Percent,
@@ -1275,7 +1357,7 @@ function Update-TrackButtons {
             $progressSlider.Dock = [System.Windows.Forms.DockStyle]::Fill
             $progressSlider.Margin = New-Object System.Windows.Forms.Padding(3, 0, 3, 0)
             $progressSlider.Tag = $file.FullName
-            $progressSlider.Enabled = $script:playbacks.ContainsKey($file.FullName)
+            $progressSlider.Enabled = $false
             $script:trackProgressSliders[$file.FullName] = $progressSlider
             $trackDuration = $null
             try {
@@ -1292,7 +1374,8 @@ function Update-TrackButtons {
                     -Path $file.FullName `
                     -Duration $trackDuration `
                     -TimeLabel $timeLabel `
-                    -ProgressSlider $progressSlider
+                    -ProgressSlider $progressSlider `
+                    -InitialPositionMs $script:trackOffsets[$file.FullName].StartTimeMs
             }
             if ($script:playbacks.ContainsKey($file.FullName)) {
                 $playback = $script:playbacks[$file.FullName]
@@ -1378,6 +1461,7 @@ function Update-TrackButtons {
                 FadeOutInput = $fadeOutInput
                 StartTimeInput = $startOffsetInput
                 EndTimeInput = $endOffsetInput
+                ProgressSlider = $progressSlider
             }
             $playButton.Margin = New-Object System.Windows.Forms.Padding(3, 3, 3, 9)
             $script:trackPlayButtons[$file.FullName] = $playButton
@@ -1403,14 +1487,19 @@ function Update-TrackButtons {
                     } else {
                         $deviceIndex = $selectedIndex - 1
                     }
+                    $playbackRange = Resolve-TrackPlaybackRange `
+                        -SelectedTimeMs $this.Tag.ProgressSlider.Value `
+                        -ConfiguredStartTimeMs $script:trackOffsets[$path].StartTimeMs `
+                        -ConfiguredEndTimeMs $script:trackOffsets[$path].EndTimeMs `
+                        -DurationMs ([long][Math]::Floor($script:trackDurations[$path].TotalMilliseconds))
                     Start-TrackPlayback `
                         -Path $this.Tag.Path `
                         -DeviceIndex $deviceIndex `
                         -Volume $this.Tag.VolumeSlider.Value `
                         -FadeInMs $this.Tag.FadeInInput.Value `
                         -FadeOutMs $this.Tag.FadeOutInput.Value `
-                        -StartTimeMs $script:trackOffsets[$path].StartTimeMs `
-                        -EndTimeMs $script:trackOffsets[$path].EndTimeMs
+                        -StartTimeMs $playbackRange.StartTimeMs `
+                        -EndTimeMs $playbackRange.EndTimeMs
                 }
             })
 
@@ -1493,6 +1582,7 @@ function Update-TrackButtons {
                 FadeOutInput = $fadeOutInput
                 StartTimeInput = $startOffsetInput
                 EndTimeInput = $endOffsetInput
+                ProgressSlider = $progressSlider
             }
             $script:trackOffsetNowLinks[$file.FullName] = @(
                 $startOffsetNowLink,
@@ -1518,7 +1608,7 @@ function Resize-TrackRows {
 }
 
 function Resize-DeviceRows {
-    $rowWidth = [Math]::Max(300, $script:devicePanel.ClientSize.Width - 24)
+    $rowWidth = [Math]::Max(1, $script:devicePanel.ClientSize.Width - 24)
     foreach ($row in $script:devicePanel.Controls) {
         if ($row -is [System.Windows.Forms.TableLayoutPanel]) {
             $row.Width = $rowWidth
@@ -1537,7 +1627,7 @@ $script:devicePanel = New-Object System.Windows.Forms.FlowLayoutPanel
 $script:devicePanel.Dock = [System.Windows.Forms.DockStyle]::Top
 $script:devicePanel.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
 $script:devicePanel.WrapContents = $false
-$script:devicePanel.AutoScroll = $true
+$script:devicePanel.AutoScroll = $false
 $script:devicePanel.Padding = New-Object System.Windows.Forms.Padding(8, 4, 8, 4)
 
 $deviceDivider = New-Object System.Windows.Forms.Panel
@@ -1645,18 +1735,19 @@ try {
         $deviceRow.RowCount = 1
         $deviceRow.Margin = New-Object System.Windows.Forms.Padding(2)
         $deviceRow.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle(
-            [System.Windows.Forms.SizeType]::Percent,
-            100
-        )))
-        $deviceRow.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle(
             [System.Windows.Forms.SizeType]::Absolute,
             220
+        )))
+        $deviceRow.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle(
+            [System.Windows.Forms.SizeType]::Percent,
+            100
         )))
 
         $radio = New-Object System.Windows.Forms.RadioButton
         $radio.Text = $device.FriendlyName
         $radio.Tag = $index
         $radio.Dock = [System.Windows.Forms.DockStyle]::Fill
+        $radio.AutoEllipsis = $true
         $radio.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
         $radio.Margin = New-Object System.Windows.Forms.Padding(4)
         if ($index -eq 0) {
@@ -1699,8 +1790,8 @@ try {
         $script:deviceMasterVolumes[$index] = $masterSlider.Value
         $script:initialDeviceVolumes += $masterSlider.Value
         $script:deviceMasterSliders += $masterSlider
-        $deviceRow.Controls.Add($radio, 0, 0)
-        $deviceRow.Controls.Add($masterSlider, 1, 0)
+        $deviceRow.Controls.Add($masterSlider, 0, 0)
+        $deviceRow.Controls.Add($radio, 1, 0)
         $script:devicePanel.Controls.Add($deviceRow)
     }
 
@@ -1820,10 +1911,7 @@ $refreshTimer.Add_Tick({
         Update-TrackButtons
 
         foreach ($path in @($script:playbacks.Keys)) {
-            if (
-                $script:playbacks[$path].Output.PlaybackState -eq [NAudio.Wave.PlaybackState]::Stopped -or
-                $script:playbacks[$path].Reader.CurrentTime -ge $script:playbacks[$path].EndTime
-            ) {
+            if (Test-TrackPlaybackComplete -Playback $script:playbacks[$path]) {
                 Stop-TrackPlayback -Path $path
             }
         }
@@ -1845,7 +1933,7 @@ $fadeTimer.Add_Tick({
     try {
         foreach ($path in @($script:playbacks.Keys)) {
             $playback = $script:playbacks[$path]
-            if ($playback.Reader.CurrentTime -ge $playback.EndTime) {
+            if (Test-TrackPlaybackComplete -Playback $playback) {
                 Stop-TrackPlayback -Path $path
                 continue
             }

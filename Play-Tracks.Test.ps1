@@ -26,11 +26,14 @@ $functionsUnderTest = @(
     'Format-TrackTimestamp',
     'ConvertFrom-TrackTimestamp',
     'Set-TrackTimestampControl',
+    'Resolve-TrackPlaybackRange',
     'Get-TrackDuration',
     'Set-TrackDurationControls',
     'Update-TrackPlaybackProgress',
     'Seek-TrackPlayback',
     'Update-TrackPlaybackVolume',
+    'Resolve-TrackEndTime',
+    'Test-TrackPlaybackComplete',
     'Get-TrackFiles',
     'Get-TrackSettingsSnapshot',
     'Save-TrackSettings',
@@ -116,6 +119,40 @@ Describe 'Play-Tracks regression tests' {
         [Math]::Abs($playback.VolumeProvider.Volume - 0.2) | Should BeLessThan 0.06
     }
 
+    It 'preserves sub-millisecond duration when the end timestamp is the displayed track length' {
+        $duration = [TimeSpan]::FromTicks(1253009000)
+        $displayedEndMs = [long][Math]::Floor($duration.TotalMilliseconds)
+
+        $naturalEnd = Resolve-TrackEndTime -Duration $duration -EndTimeMs $displayedEndMs
+        $earlyEnd = Resolve-TrackEndTime -Duration $duration -EndTimeMs 125299
+
+        $naturalEnd.Ticks | Should Be $duration.Ticks
+        $earlyEnd.Ticks | Should Be ([TimeSpan]::FromMilliseconds(125299).Ticks)
+    }
+
+    It 'detects natural EOF within tolerance without shortening early ends or paused playback' {
+        $playback = @{
+            Reader = [pscustomobject]@{ CurrentTime = [TimeSpan]::FromMilliseconds(25933) }
+            Output = [pscustomobject]@{ PlaybackState = 'Playing' }
+            Duration = [TimeSpan]::FromMilliseconds(25944)
+            EndTime = [TimeSpan]::FromMilliseconds(25944)
+            IsPaused = $false
+        }
+
+        (Test-TrackPlaybackComplete -Playback $playback) | Should Be $true
+
+        $playback.EndTime = [TimeSpan]::FromMilliseconds(25930)
+        $playback.Reader.CurrentTime = [TimeSpan]::FromMilliseconds(25920)
+        (Test-TrackPlaybackComplete -Playback $playback) | Should Be $false
+
+        $playback.EndTime = $playback.Duration
+        $playback.IsPaused = $true
+        (Test-TrackPlaybackComplete -Playback $playback) | Should Be $false
+
+        $playback.Output.PlaybackState = 'Stopped'
+        (Test-TrackPlaybackComplete -Playback $playback) | Should Be $true
+    }
+
     It 'applies the fade-out envelope and returns to the requested volume when fades are disabled' {
         $script:trackVolumes['track.mp3'] = 60
         $playback = @{
@@ -153,7 +190,7 @@ Describe 'Play-Tracks regression tests' {
         [Math]::Abs($playback.VolumeProvider.Volume - 0.4) | Should BeLessThan 0.02
     }
 
-    It 'stops and disposes only the requested track playback and disables its progress slider' {
+    It 'stops and disposes only the requested track playback and keeps its progress slider enabled' {
         $output = [pscustomobject]@{ StopCount = 0; DisposeCount = 0 }
         $output | Add-Member ScriptMethod Stop { $this.StopCount++ }
         $output | Add-Member ScriptMethod Dispose { $this.DisposeCount++ }
@@ -163,6 +200,7 @@ Describe 'Play-Tracks regression tests' {
         $script:playbacks['first.mp3'] = @{
             Output = $output
             VolumeProvider = $provider
+            Duration = [TimeSpan]::FromSeconds(10)
         }
         $script:playbacks['second.mp3'] = $otherPlayback
         $script:trackProgressSliders['first.mp3'] = [pscustomobject]@{
@@ -180,7 +218,7 @@ Describe 'Play-Tracks regression tests' {
         $output.StopCount | Should Be 1
         $output.DisposeCount | Should Be 1
         $provider.DisposeCount | Should Be 1
-        $script:trackProgressSliders['first.mp3'].Enabled | Should Be $false
+        $script:trackProgressSliders['first.mp3'].Enabled | Should Be $true
         $script:trackProgressSliders['first.mp3'].Value | Should Be 0
     }
 
@@ -221,7 +259,7 @@ Describe 'Play-Tracks regression tests' {
         $button.Checked | Should Be $false
         $button.Text | Should Be 'Play'
         $slider.Value | Should Be 0
-        $slider.Enabled | Should Be $false
+        $slider.Enabled | Should Be $true
         $provider.DisposeCount | Should Be 1
     }
 
@@ -331,12 +369,12 @@ Describe 'Play-Tracks regression tests' {
         $slider.Maximum | Should Be 180000
         $slider.Value | Should Be 90000
         $slider.Enabled | Should Be $true
-        $label.Text | Should Be '1:30 / 3:00'
+        $label.Text | Should Be '01:30 / 03:00'
     }
 
     It 'loads and displays track duration before playback and disposes the reader' {
         $reader = [pscustomobject]@{
-            TotalTime = [TimeSpan]::FromSeconds(125)
+            TotalTime = [TimeSpan]::FromMilliseconds(125300)
             DisposeCount = 0
         }
         $reader | Add-Member ScriptMethod Dispose { $this.DisposeCount++ }
@@ -348,7 +386,7 @@ Describe 'Play-Tracks regression tests' {
             $script:testDurationReader
         }
         $label = [pscustomobject]@{ Text = '' }
-        $slider = [pscustomobject]@{ Minimum = 0; Maximum = 1; Value = 0 }
+        $slider = [pscustomobject]@{ Minimum = 0; Maximum = 1; Value = 0; Enabled = $false }
 
         $duration = Get-TrackDuration -Path 'track.mp3' -ReaderFactory $readerFactory
         Set-TrackDurationControls `
@@ -359,10 +397,29 @@ Describe 'Play-Tracks regression tests' {
 
         $script:requestedReaderPath | Should Be 'track.mp3'
         $reader.DisposeCount | Should Be 1
-        $label.Text | Should Be '0:00 / 2:05'
-        $slider.Maximum | Should Be 125000
+        $label.Text | Should Be '00:00 / 02:05.300'
+        $slider.Maximum | Should Be 125300
         $slider.Value | Should Be 0
-        $script:trackDurations['track.mp3'] | Should Be ([TimeSpan]::FromSeconds(125))
+        $slider.Enabled | Should Be $true
+        $script:trackDurations['track.mp3'] | Should Be ([TimeSpan]::FromMilliseconds(125300))
+    }
+
+    It 'starts playback at the selected progress position and extends to track end outside the configured range' {
+        $insideRange = Resolve-TrackPlaybackRange `
+            -SelectedTimeMs 90000 `
+            -ConfiguredStartTimeMs 65000 `
+            -ConfiguredEndTimeMs 150000 `
+            -DurationMs 180000
+        $insideRange.StartTimeMs | Should Be 90000
+        $insideRange.EndTimeMs | Should Be 150000
+
+        $outsideRange = Resolve-TrackPlaybackRange `
+            -SelectedTimeMs 160000 `
+            -ConfiguredStartTimeMs 65000 `
+            -ConfiguredEndTimeMs 150000 `
+            -DurationMs 180000
+        $outsideRange.StartTimeMs | Should Be 160000
+        $outsideRange.EndTimeMs | Should Be 180000
     }
 
     It 'allows seeking outside configured offsets while retaining the full-track progress range' {
